@@ -1,0 +1,20 @@
+﻿<#@ template language="C#" #>
+<#@ assembly name="System.Core" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Collections.Generic" #>
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id><#= PackageName #></id>
+    <title>CMS Content Package</title>
+    <version><#= Version #></version>
+    <authors>RWWA</authors>
+    <owners>RWWA</owners>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>A content package containing files exported from a CMS.</description>
+  </metadata>
+  <files>
+    <file src="content\**\*.*" target="" />
+  </files>
+</package>
