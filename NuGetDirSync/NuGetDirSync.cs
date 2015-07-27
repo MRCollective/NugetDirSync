@@ -1,27 +1,26 @@
-﻿using Holf.AllForOne;
-using Microsoft.VisualBasic.Devices;
-using Microsoft.VisualBasic.Logging;
-using System;
+﻿using System;
 using System.Configuration;
 using System.Diagnostics;
 using System.IO;
-using System.Timers;
+using System.Reactive.Concurrency;
+using System.Reactive.Disposables;
+using System.Reactive.Linq;
+using Holf.AllForOne;
+using Microsoft.VisualBasic.Devices;
+using Microsoft.VisualBasic.Logging;
 
 namespace NuGetDirSync
 {
     public class NuGetDirSync
     {
-        private readonly object _lock = new object();
-        private Timer _notificationTimer;
-
-        private readonly string _tempPath = ConfigurationManager.AppSettings["TempPath"];
-        private readonly string _versionFile = ConfigurationManager.AppSettings["VersionFile"];
-        private readonly string _packageName = ConfigurationManager.AppSettings["PackageName"];
-        private readonly string _packageNuSpec = ConfigurationManager.AppSettings["PackageNuSpec"];
-        private readonly string _watchFolder = ConfigurationManager.AppSettings["WatchFolder"];
-        private readonly string _nugetServer = ConfigurationManager.AppSettings["NuGetServer"];
         private readonly string _apiKey = ConfigurationManager.AppSettings["NuGetApiKey"];
         private readonly double _furtherChangesWaitSeconds = Convert.ToDouble(ConfigurationManager.AppSettings["FurtherChangesWaitSeconds"]);
+        private readonly string _nugetServer = ConfigurationManager.AppSettings["NuGetServer"];
+        private readonly string _packageName = ConfigurationManager.AppSettings["PackageName"];
+        private readonly string _tempPath = ConfigurationManager.AppSettings["TempPath"];
+        private readonly string _versionFile = ConfigurationManager.AppSettings["VersionFile"];
+        private readonly string _watchFolder = ConfigurationManager.AppSettings["WatchFolder"];
+        private IDisposable _currentSubscription;
 
         public NuGetDirSync()
         {
@@ -43,81 +42,153 @@ namespace NuGetDirSync
                 throw new Exception("One or more configuration values is missing in App.config.");
             }
 
-            _notificationTimer = new Timer();
-            _notificationTimer.Elapsed += notificationTimer_Elapsed;
-            _notificationTimer.Interval = _furtherChangesWaitSeconds;
-            var fileSystemWatcher = new FileSystemWatcher(_watchFolder)
-            {
-                EnableRaisingEvents = true,
-                Filter = "*.*",
-                IncludeSubdirectories = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite
-            };
-            fileSystemWatcher.Created += FolderUpdated;
-            fileSystemWatcher.Changed += FolderUpdated;
-            fileSystemWatcher.Deleted += FolderUpdated;
-            fileSystemWatcher.Renamed += FolderUpdated;
+            var wait = TimeSpan.FromSeconds(_furtherChangesWaitSeconds);
+            _currentSubscription = CreateObservableFileSystemStream(_watchFolder)
+                .Do(x => Trace.TraceInformation("Changes Detected - Waiting for more"))
+                .Throttle(wait)
+                .ObserveLatestOn(CurrentThreadScheduler.Instance)
+                .Do(_ => Trace.TraceInformation("Begining packaging process"))
+                .Select(_ => GetAndIncrementVersion())
+                .Subscribe(BuildAndDeployPackage);
         }
 
         public void Stop()
         {
+            var currentSubscription = _currentSubscription;
+            if (currentSubscription != null)
+                currentSubscription.Dispose();
+            _currentSubscription = null;
         }
 
-        private void notificationTimer_Elapsed(object sender, ElapsedEventArgs e)
+        private Version GetAndIncrementVersion()
         {
-            lock (_lock)
+            var currentVersion = 1;
+            if (File.Exists(_versionFile))
+                currentVersion = Convert.ToInt32(File.ReadAllText(_versionFile));
+
+            File.WriteAllText(_versionFile, (currentVersion + 1).ToString());
+
+            return new Version(0, 0, currentVersion);
+        }
+
+        private void BuildAndDeployPackage(Version packageVersion)
+        {
+            var workingDirPath = Path.Combine(_tempPath, string.Format("{0}", packageVersion));
+            CloneContent(workingDirPath);
+
+            var packagePath = BuildPackage(packageVersion, workingDirPath, _packageName);
+            PushPackage(packagePath, _apiKey, _nugetServer);
+
+            CleanUp(workingDirPath);
+        }
+
+        private static void CleanUp(string workingDirPath)
+        {
+            Trace.TraceInformation("Cleaning up - deleting {0}", workingDirPath);
+            Directory.Delete(workingDirPath, true);
+        }
+
+        private void CloneContent(string workingDirPath)
+        {
+            Trace.TraceInformation("Cloning directory to {0}", workingDirPath);
+            Directory.CreateDirectory(workingDirPath);
+            new Computer().FileSystem.CopyDirectory(_watchFolder, Path.Combine(workingDirPath, "content"));
+        }
+
+        private void PushPackage(string packagePath, string apiKey, string nugetServer)
+        {
+            Trace.TraceInformation("Publising package - {0}", packagePath);
+            if (string.IsNullOrWhiteSpace(packagePath))
+                return;
+
+            var nugetPushProcessInfo = new ProcessStartInfo("NuGet.exe", string.Format("push {0} -ApiKey {1} -Source {2}", packagePath, apiKey, nugetServer))
             {
-                Trace.TraceInformation("Changes completed, creating package.");
-                var nextVersion = 1;
-                if (File.Exists(_versionFile))
-                    nextVersion = Convert.ToInt32(File.ReadAllText(_versionFile));
-                if (Directory.Exists(_tempPath))
-                    Directory.Delete(_tempPath, true);
-                new Computer().FileSystem.CopyDirectory(_watchFolder, _tempPath);
-                File.WriteAllText(_packageNuSpec, string.Format(File.ReadAllText(_packageNuSpec), _packageName));
-                var nugetPackProcess = new ProcessStartInfo("NuGet.exe", string.Format("pack {0} -Version 0.0.{1}", _packageNuSpec, nextVersion))
-                {
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false
-                };
-                var nugetPushProcess = new ProcessStartInfo("NuGet.exe", string.Format("push {0}.0.0.{1}.nupkg -ApiKey {2} -Source {3}", _packageName, nextVersion, _apiKey, _nugetServer))
-                {
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false
-                };
-                using (var resource1 = Process.Start(nugetPackProcess))
-                {
-                    resource1.TieLifecycleToParentProcess();
-                    resource1.WaitForExit();
-                    Trace.TraceInformation(resource1.StandardOutput.ReadToEnd());
-                    Trace.TraceError(resource1.StandardError.ReadToEnd());
-                    if (resource1.ExitCode == 0)
-                    {
-                        using (var resource0 = Process.Start(nugetPushProcess))
-                        {
-                            resource0.TieLifecycleToParentProcess();
-                            resource0.WaitForExit();
-                            Trace.TraceInformation(resource0.StandardOutput.ReadToEnd());
-                            Trace.TraceError(resource0.StandardError.ReadToEnd());
-                            if (resource0.ExitCode == 0)
-                            {
-                                Trace.TraceInformation("Successfully generated and pushed package {0}.0.0.{1}.nupkg", _packageName, nextVersion);
-                                File.WriteAllText(_versionFile, (nextVersion + 1).ToString());
-                            }
-                        }
-                    }
-                }
-                _notificationTimer.Stop();
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            };
+
+            if (!RunSystemProcess(nugetPushProcessInfo))
+            {
+                Trace.TraceError("Publish failed - {0}", packagePath);
             }
         }
 
-        private void FolderUpdated(object sender, FileSystemEventArgs e)
+        private string BuildPackage(Version packageVersion, string workingDirPath, string packageName)
         {
-            Trace.TraceInformation("Change detected in folder, waiting for further changes...");
-            _notificationTimer.Stop();
-            _notificationTimer.Start();
+            Trace.TraceInformation("Building Package - {0}", packageVersion);
+
+            var nuSpecFileName = Path.Combine(workingDirPath, string.Format("{0}.nuspec", packageName));
+            var nuSpecContent = new PackageSpecTemplate(packageVersion, packageName).TransformText();
+            File.WriteAllText(nuSpecFileName, nuSpecContent);
+
+            var outputDirectory = workingDirPath;
+            var nugetPackProcessInfo = new ProcessStartInfo("NuGet.exe", string.Format("pack {0} -OutputDirectory {1}", nuSpecFileName, outputDirectory))
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            };
+
+            if (RunSystemProcess(nugetPackProcessInfo))
+            {
+                return string.Format(Path.Combine(outputDirectory, string.Format("{0}.{1}.nupkg", packageName, packageVersion)));
+            }
+
+            Trace.TraceError("Build package failed - {0}", packageVersion);
+            return null;
+        }
+
+        private IObservable<FileSystemEventArgs> CreateObservableFileSystemStream(string watchFolder)
+        {
+            return Observable.Create<FileSystemEventArgs>(observer =>
+            {
+                var fileSystemWatcher = new FileSystemWatcher(watchFolder)
+                {
+                    EnableRaisingEvents = true,
+                    Filter = "*.*",
+                    IncludeSubdirectories = true,
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite
+                };
+
+                Debug.WriteLine("FileSystemWatcher Created");
+
+                fileSystemWatcher.Created += (sender, args) => observer.OnNext(args);
+                fileSystemWatcher.Changed += (sender, args) => observer.OnNext(args);
+                fileSystemWatcher.Deleted += (sender, args) => observer.OnNext(args);
+                fileSystemWatcher.Renamed += (sender, args) => observer.OnNext(args);              
+
+                return fileSystemWatcher;
+            });
+        }
+
+        private static bool RunSystemProcess(ProcessStartInfo startInfo)
+        {
+            using (var process = Process.Start(startInfo))
+            {
+                if (process == null)
+                {
+                    Trace.TraceError("Failed to start process {0} {1}", startInfo.FileName, startInfo.Arguments);
+                    return false;
+                }
+                process.TieLifecycleToParentProcess();
+                process.WaitForExit();
+
+                var stdOut = process.StandardOutput.ReadToEnd();
+                if (!string.IsNullOrWhiteSpace(stdOut))
+                    Trace.TraceInformation(stdOut);
+
+                var stdErr = process.StandardError.ReadToEnd();
+                if (!string.IsNullOrWhiteSpace(stdErr))
+                    Trace.TraceError(stdErr);
+
+                if (process.ExitCode == 0)
+                {
+                    return true;
+                }
+                Trace.TraceError("Process failed: {0} {1}", startInfo.FileName, startInfo.Arguments);
+                return false;
+            }
         }
     }
 }
